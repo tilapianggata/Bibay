@@ -1,26 +1,19 @@
 const ENTRIES_KEY = 'cycle_entries';
 const MOODS_KEY = 'cycle_moods';
 
-// Seed data — only used the very first time the app runs on a device, and
-// only in local-only mode (never pushed to a shared room automatically).
-const SEED_ENTRIES = [
-  { start: '2026-01-14', end: '2026-01-18' },
-  { start: '2026-02-20', end: '2026-02-25' },
-  { start: '2026-04-19', end: '2026-04-24' },
-  { start: '2026-06-03', end: null },
-  { start: '2026-07-30', end: '2026-08-04' },
-  { start: '2026-09-07', end: null }
-];
+let entries = []; // [{start, end, id?, pending?}]
+let moods = [];   // [{date, mood, pending?}]
+let calView = (() => { const n = new Date(); return { y: n.getFullYear(), m: n.getMonth() }; })();
 
-let entries = [];
-let moods = []; // [{date, mood, user?}]
-let roomConfig = null;
-let realtimeChannel = null;
-
-function todayISO() { return new Date().toISOString().slice(0, 10); }
-function daysBetween(a, b) { return Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000); }
-function fmtDate(iso) { return new Date(iso + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); }
-function fmtDateShort(iso) { return new Date(iso + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
+// ---------- Date helpers (all local time; toISOString() shifts the day in UTC+ zones) ----------
+function pad(n) { return String(n).padStart(2, '0'); }
+function toISO(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function parseISO(iso) { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d); }
+function addDays(iso, n) { const d = parseISO(iso); d.setDate(d.getDate() + n); return toISO(d); }
+function todayISO() { return toISO(new Date()); }
+function daysBetween(a, b) { return Math.round((parseISO(b) - parseISO(a)) / 86400000); }
+function fmtDate(iso) { return parseISO(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); }
+function fmtDateShort(iso) { return parseISO(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
 function average(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null; }
 function stdDev(arr) {
   if (arr.length < 2) return 0;
@@ -28,15 +21,13 @@ function stdDev(arr) {
   return Math.sqrt(average(arr.map(x => (x - avg) ** 2)));
 }
 
-// ---------- Local cache (used as offline fallback + local-only mode) ----------
+// ---------- Local cache (offline fallback) ----------
 function loadLocalEntries() {
   try {
     entries = JSON.parse(localStorage.getItem(ENTRIES_KEY));
     if (!Array.isArray(entries)) throw new Error('bad data');
-  } catch (e) {
-    entries = isConnected() ? [] : SEED_ENTRIES.slice();
-  }
-  entries.sort((a, b) => new Date(a.start) - new Date(b.start));
+  } catch (e) { entries = []; }
+  entries.sort((a, b) => a.start.localeCompare(b.start));
 }
 function saveLocalEntries() {
   localStorage.setItem(ENTRIES_KEY, JSON.stringify(entries));
@@ -46,11 +37,56 @@ function loadLocalMoods() {
   try {
     moods = JSON.parse(localStorage.getItem(MOODS_KEY));
     if (!Array.isArray(moods)) throw new Error('bad data');
-  } catch (e) {
-    moods = [];
-  }
+  } catch (e) { moods = []; }
 }
 function saveLocalMoods() { localStorage.setItem(MOODS_KEY, JSON.stringify(moods)); }
+
+// ---------- Cloud sync ----------
+function setStatus(msg, ok) {
+  const el = document.getElementById('syncStatus');
+  el.textContent = msg;
+  el.className = 'sync-status' + (ok === true ? ' ok' : ok === false ? ' bad' : '');
+}
+function syncFailed() {
+  const why = !isConnected() ? 'No connection.' : (lastSyncError ? lastSyncError.slice(0, 80) : '');
+  setStatus(`Not saved to the cloud yet (kept on this phone). ${why}`, false);
+}
+
+let syncing = false;
+async function syncNow() {
+  if (syncing) return;
+  if (!isConnected()) initSupabase();
+  if (!isConnected()) { syncFailed(); return; }
+  syncing = true;
+  setStatus('Syncing…');
+  try {
+    let remoteEntries = await fetchEntriesRemote();
+    let remoteMoods = await fetchMoodsRemote();
+    if (remoteEntries === null || remoteMoods === null) { syncFailed(); return; }
+
+    // Push anything saved offline (or everything, if the cloud is still empty).
+    const known = new Set(remoteEntries.map(e => e.start));
+    const pushEntries = entries.filter(e => (e.pending || remoteEntries.length === 0) && !known.has(e.start));
+    for (const e of pushEntries) {
+      if (!(await addEntryRemote(e.start, e.end))) { syncFailed(); return; }
+    }
+    const pushMoods = moods.filter(m => m.pending || remoteMoods.length === 0);
+    for (const m of pushMoods) {
+      if (!(await upsertMoodRemote(m.date, m.mood))) { syncFailed(); return; }
+    }
+
+    if (pushEntries.length) remoteEntries = await fetchEntriesRemote();
+    if (pushMoods.length) remoteMoods = await fetchMoodsRemote();
+    if (remoteEntries === null || remoteMoods === null) { syncFailed(); return; }
+
+    entries = remoteEntries; saveLocalEntries();
+    moods = remoteMoods; saveLocalMoods();
+    render();
+    setStatus('Saved to the cloud ✓', true);
+  } finally {
+    syncing = false;
+  }
+}
 
 // ---------- Core calculations ----------
 function computeCycleLengths() {
@@ -69,8 +105,42 @@ function getPredictionInfo() {
   return { avgCycle, sd, lastStart, avgPeriod: average(computePeriodLengths()) || 5 };
 }
 
+// Maps every date in the logged/predicted range to a calendar type:
+// period | predicted | follicular | fertile | luteal
+function buildDayMap() {
+  const map = {};
+  if (!entries.length) return map;
+  const { avgCycle, avgPeriod } = getPredictionInfo();
+  const L = Math.max(Math.round(avgCycle), 20);
+  const P = Math.max(Math.round(avgPeriod), 1);
+
+  const cycles = entries.map(e => ({ start: e.start, end: e.end, predicted: false }));
+  if (entries.length >= 2) {
+    const last = entries[entries.length - 1].start;
+    for (let i = 1; i <= 3; i++) cycles.push({ start: addDays(last, L * i), end: null, predicted: true });
+  }
+  cycles.forEach((c, i) => {
+    const next = i + 1 < cycles.length ? cycles[i + 1].start : addDays(c.start, L);
+    const len = Math.max(daysBetween(c.start, next), 1);
+    const ovulation = len - 14;
+    const periodEnd = c.end || addDays(c.start, P - 1);
+    for (let n = 0; n < len; n++) {
+      const iso = addDays(c.start, n);
+      const day = n + 1;
+      let type;
+      if (iso <= periodEnd) type = c.predicted ? 'predicted' : 'period';
+      else if (day < ovulation - 4) type = 'follicular';
+      else if (day <= ovulation + 1) type = 'fertile';
+      else type = 'luteal';
+      map[iso] = type;
+    }
+  });
+  return map;
+}
+
 // ---------- Rendering ----------
 function render() {
+  renderCalendar();
   renderStats();
   renderPredictions();
   renderSuggestions();
@@ -78,10 +148,54 @@ function render() {
   renderMood();
 }
 
+const DROP_SVG = '<svg viewBox="0 0 40 48" aria-hidden="true"><path d="M20 3C20 3 6 19 6 31a14 14 0 0 0 28 0C34 19 20 3 20 3Z"/></svg>';
+const TYPE_LABEL = {
+  period: 'period', predicted: 'expected period', follicular: 'follicular phase',
+  fertile: 'fertile window', luteal: 'luteal phase'
+};
+
+function renderCalendar() {
+  const { y, m } = calView;
+  const map = buildDayMap();
+  const first = new Date(y, m, 1);
+  const lead = (first.getDay() + 6) % 7; // week starts Monday
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const today = todayISO();
+
+  document.getElementById('calTitle').textContent =
+    first.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+
+  let html = ['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(d => `<div class="cal-dow">${d}</div>`).join('');
+  html += '<div></div>'.repeat(lead);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const iso = `${y}-${pad(m + 1)}-${pad(d)}`;
+    const type = map[iso] || '';
+    const drop = (type === 'period' || type === 'predicted') ? DROP_SVG : '';
+    const label = `${fmtDate(iso)}${type ? ', ' + TYPE_LABEL[type] : ''}`;
+    html += `<button class="cal-day ${type}${iso === today ? ' today' : ''}" data-date="${iso}" aria-label="${label}">${drop}<span class="num">${d}</span></button>`;
+  }
+  document.getElementById('calGrid').innerHTML = html;
+}
+
+document.getElementById('calPrev').addEventListener('click', () => shiftMonth(-1));
+document.getElementById('calNext').addEventListener('click', () => shiftMonth(1));
+function shiftMonth(delta) {
+  const d = new Date(calView.y, calView.m + delta, 1);
+  calView = { y: d.getFullYear(), m: d.getMonth() };
+  renderCalendar();
+}
+document.getElementById('calGrid').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.cal-day');
+  if (!btn) return;
+  const input = document.getElementById('startInput');
+  input.value = btn.getAttribute('data-date');
+  input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+
 function renderStats() {
   const { avgCycle, avgPeriod, sd } = getPredictionInfo();
   document.getElementById('stats').innerHTML = `
-    <div class="stat"><div class="num">${entries.length ? Math.round(avgCycle) : '–'}</div><div class="label">Avg cycle length (days)</div></div>
+    <div class="stat"><div class="num">${entries.length > 1 ? Math.round(avgCycle) : '–'}</div><div class="label">Avg cycle length (days)</div></div>
     <div class="stat"><div class="num">${entries.some(e => e.end) ? Math.round(avgPeriod) : '–'}</div><div class="label">Avg period length (days)</div></div>
     <div class="stat"><div class="num">${entries.length}</div><div class="label">Periods logged</div></div>
     <div class="stat"><div class="num">${sd ? '±' + Math.round(sd) : '–'}</div><div class="label">Cycle variability</div></div>
@@ -97,37 +211,28 @@ function renderPredictions() {
     return;
   }
   const { avgCycle, sd, lastStart } = getPredictionInfo();
+  const spread = Math.round(sd || 3);
   const rows = [];
-  const base = new Date(lastStart + 'T00:00:00');
   for (let i = 1; i <= 3; i++) {
-    const predicted = new Date(base);
-    predicted.setDate(predicted.getDate() + Math.round(avgCycle * i));
-    const early = new Date(predicted); early.setDate(early.getDate() - Math.round(sd || 3));
-    const late = new Date(predicted); late.setDate(late.getDate() + Math.round(sd || 3));
+    const predicted = addDays(lastStart, Math.round(avgCycle * i));
     rows.push(`
       <div class="predict-row">
         <div>
-          <div class="predict-date">${predicted.toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}</div>
+          <div class="predict-date">${parseISO(predicted).toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}</div>
           <div class="predict-tag">${i === 1 ? 'Next period' : `Cycle +${i}`}</div>
         </div>
-        <div class="predict-range">${early.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} – ${late.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</div>
+        <div class="predict-range">${fmtDateShort(addDays(predicted, -spread))} – ${fmtDateShort(addDays(predicted, spread))}</div>
       </div>`);
   }
   predEl.innerHTML = rows.join('');
-  const cycleLengths = computeCycleLengths();
+  const n = computeCycleLengths().length;
   const variability = sd > 10 ? 'highly irregular' : sd > 5 ? 'somewhat irregular' : 'fairly regular';
-  noteEl.textContent = `Based on ${cycleLengths.length} cycle(s) logged, your cycle has been ${variability} (varying roughly ±${Math.round(sd)} days). Predictions are estimates, not guarantees.`;
+  noteEl.textContent = `Based on ${n} cycle(s) logged, your cycle has been ${variability} (varying roughly ±${Math.round(sd)} days). Predictions are estimates, not guarantees.`;
 }
 
 function currentCyclePhase() {
-  if (!entries.length) return null;
-  const { avgCycle, avgPeriod, lastStart } = getPredictionInfo();
-  const dayInCycle = (daysBetween(lastStart, todayISO()) % Math.round(avgCycle) + Math.round(avgCycle)) % Math.round(avgCycle) + 1;
-  const ovulationDay = Math.max(1, Math.round(avgCycle) - 14);
-  if (dayInCycle <= avgPeriod) return 'menstrual';
-  if (dayInCycle < ovulationDay - 1) return 'follicular';
-  if (dayInCycle <= ovulationDay + 1) return 'ovulation';
-  return 'luteal';
+  const type = buildDayMap()[todayISO()];
+  return { period: 'menstrual', predicted: 'menstrual', follicular: 'follicular', fertile: 'ovulation', luteal: 'luteal' }[type] || null;
 }
 
 const PHASE_TIPS = {
@@ -157,12 +262,9 @@ function renderSuggestions() {
   let tips = [];
   if (phase) tips = tips.concat(PHASE_TIPS[phase]);
 
-  const recentMoods = moods.slice(-3);
-  if (recentMoods.length >= 2) {
-    const avgMood = average(recentMoods.map(m => m.mood));
-    if (avgMood <= 2) {
-      tips.push({ tag: 'Check in', text: "You've logged a few lower moods recently — it might help to lighten your schedule, get extra rest, or talk to someone you trust." });
-    }
+  const recentMoods = moods.slice().sort((a, b) => a.date.localeCompare(b.date)).slice(-3);
+  if (recentMoods.length >= 2 && average(recentMoods.map(m => m.mood)) <= 2) {
+    tips.push({ tag: 'Check in', text: "You've logged a few lower moods recently — it might help to lighten your schedule, get extra rest, or talk to someone you trust." });
   }
   if (!tips.length) {
     el.innerHTML = '<div class="empty">Log a period and a mood or two to get personalized suggestions.</div>';
@@ -176,15 +278,15 @@ function renderHistory() {
   const el = document.getElementById('history');
   document.getElementById('countBadge').textContent = entries.length;
   if (!entries.length) { el.innerHTML = '<div class="empty">No periods logged yet.</div>'; return; }
-  const sorted = entries.slice().sort((a, b) => new Date(b.start) - new Date(a.start));
+  const sorted = entries.slice().sort((a, b) => b.start.localeCompare(a.start));
   el.innerHTML = sorted.map(e => {
     const len = e.end ? `${daysBetween(e.start, e.end) + 1} days` : 'ongoing / not recorded';
     const dateStr = e.end
-      ? `${fmtDateShort(e.start)} – ${fmtDateShort(e.end)}, ${new Date(e.start).getFullYear()}`
+      ? `${fmtDateShort(e.start)} – ${fmtDateShort(e.end)}, ${parseISO(e.start).getFullYear()}`
       : `${fmtDate(e.start)} –`;
-    return `<div class="entry" data-start="${e.start}">
-      <div class="dates">${dateStr}<div class="len">${len}</div></div>
-      <button data-delete="${e.start}" data-id="${e.id || ''}">✕</button>
+    return `<div class="entry">
+      <div class="dates">${dateStr}<div class="len">${len}${e.pending ? ' · waiting to sync' : ''}</div></div>
+      <button data-delete="${e.start}" data-id="${e.id || ''}" aria-label="Delete entry">✕</button>
     </div>`;
   }).join('');
   el.querySelectorAll('[data-delete]').forEach(btn => {
@@ -194,177 +296,90 @@ function renderHistory() {
 
 function renderMood() {
   const today = todayISO();
-  const todays = moods.find(m => m.date === today && (!m.user || m.user === roomConfig?.userLabel));
+  const todays = moods.find(m => m.date === today);
   document.querySelectorAll('#moodRow .mood-btn').forEach(btn => {
-    btn.classList.toggle('selected', todays && String(todays.mood) === btn.getAttribute('data-mood'));
+    btn.classList.toggle('selected', !!todays && String(todays.mood) === btn.getAttribute('data-mood'));
   });
   document.getElementById('moodToday').textContent = todays ? "Today's mood logged — tap another to change it." : 'Tap one to log today.';
 
-  const recent = moods.slice().sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 7);
   const emojiFor = { 1: '😣', 2: '😔', 3: '😐', 4: '🙂', 5: '😄' };
+  const recent = moods.slice().sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7);
   document.getElementById('moodHistory').innerHTML = recent.map(m =>
-    `<div class="mood-chip">${emojiFor[m.mood]} ${fmtDateShort(m.date)}${m.user ? ' · ' + m.user : ''}</div>`
+    `<div class="mood-chip">${emojiFor[m.mood]} ${fmtDateShort(m.date)}</div>`
   ).join('');
-}
-
-async function renderMessages() {
-  const feedEl = document.getElementById('messageFeed');
-  if (!isConnected() || !roomConfig) { feedEl.innerHTML = ''; return; }
-  const msgs = await fetchMessagesRemote(roomConfig.roomCode);
-  if (!msgs) return;
-  const emojiFor = { 1: '😣', 2: '😔', 3: '😐', 4: '🙂', 5: '😄' };
-  if (!msgs.length) { feedEl.innerHTML = '<div class="empty">No messages yet.</div>'; return; }
-  feedEl.innerHTML = msgs.map(m => `
-    <div class="message">
-      <div class="who"><span>${m.user_label}${m.mood ? ' ' + emojiFor[m.mood] : ''}</span><span class="when">${new Date(m.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></div>
-      <div class="body">${escapeHtml(m.body)}</div>
-    </div>`).join('');
-}
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
 }
 
 // ---------- Actions ----------
 async function deleteEntry(start, id) {
+  if (!confirm('Delete this entry?')) return;
+  if (id) {
+    if (!isConnected() || !(await deleteEntryRemote(id))) {
+      alert('Could not delete — check your internet connection and try again.');
+      return;
+    }
+  }
   entries = entries.filter(e => e.start !== start);
   saveLocalEntries();
-  if (isConnected() && id) await deleteEntryRemote(id);
   render();
 }
 
 async function logMood(moodVal) {
   const today = todayISO();
-  const existing = moods.find(m => m.date === today && (!m.user || m.user === roomConfig?.userLabel));
-  if (existing) existing.mood = moodVal;
-  else moods.push({ date: today, mood: moodVal, user: roomConfig?.userLabel });
+  let m = moods.find(x => x.date === today);
+  if (m) { m.mood = moodVal; m.pending = true; }
+  else { m = { date: today, mood: moodVal, pending: true }; moods.push(m); }
   saveLocalMoods();
-  if (isConnected()) await upsertMoodRemote(roomConfig.roomCode, roomConfig.userLabel, today, moodVal);
   renderMood();
   renderSuggestions();
+  if (isConnected() && await upsertMoodRemote(today, moodVal)) {
+    m.pending = false;
+    saveLocalMoods();
+    setStatus('Saved to the cloud ✓', true);
+  } else {
+    syncFailed();
+  }
 }
 
 document.getElementById('addBtn').addEventListener('click', async () => {
   const start = document.getElementById('startInput').value;
   const end = document.getElementById('endInput').value;
   if (!start) { alert('Please enter a start date.'); return; }
-  let newId = null;
-  if (isConnected()) {
-    await addEntryRemote(roomConfig.roomCode, roomConfig.userLabel, start, end);
-    await refreshFromRemote(['period_entries']);
-  } else {
-    entries.push({ start, end: end || null });
-    entries.sort((a, b) => new Date(a.start) - new Date(b.start));
-    saveLocalEntries();
-  }
+  if (end && end < start) { alert('The end date is before the start date.'); return; }
+  if (entries.some(e => e.start === start)) { alert('You already logged a period starting that day.'); return; }
+
+  const entry = { start, end: end || null, pending: true };
+  entries.push(entry);
+  entries.sort((a, b) => a.start.localeCompare(b.start));
+  saveLocalEntries();
   document.getElementById('startInput').value = '';
   document.getElementById('endInput').value = '';
   render();
+
+  if (isConnected() && await addEntryRemote(start, end)) {
+    entry.pending = false;
+    syncNow(); // re-pulls so the entry gets its cloud id
+  } else {
+    syncFailed();
+  }
 });
 
 document.querySelectorAll('#moodRow .mood-btn').forEach(btn => {
   btn.addEventListener('click', () => logMood(Number(btn.getAttribute('data-mood'))));
 });
 
-let selectedShareMood = null;
-document.querySelectorAll('#shareMoodRow .mood-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    selectedShareMood = Number(btn.getAttribute('data-share-mood'));
-    document.querySelectorAll('#shareMoodRow .mood-btn').forEach(b => b.classList.toggle('selected', b === btn));
-  });
-});
-document.getElementById('sendShareBtn').addEventListener('click', async () => {
-  if (!isConnected()) { alert('Connect to a shared account first (see the Shared Account card above).'); return; }
-  const text = document.getElementById('shareText').value.trim();
-  if (!text && !selectedShareMood) { alert('Pick a mood or write a note first.'); return; }
-  await sendMessageRemote(roomConfig.roomCode, roomConfig.userLabel, text || '(no note)', selectedShareMood);
-  document.getElementById('shareText').value = '';
-  selectedShareMood = null;
-  document.querySelectorAll('#shareMoodRow .mood-btn').forEach(b => b.classList.remove('selected'));
-  renderMessages();
-});
-
-// ---------- Shared account setup ----------
-function populateSetupForm() {
-  if (!roomConfig) return;
-  document.getElementById('supaUrl').value = roomConfig.url || '';
-  document.getElementById('supaKey').value = roomConfig.anonKey || '';
-  document.getElementById('roomCode').value = roomConfig.roomCode || '';
-  document.getElementById('userLabel').value = roomConfig.userLabel || '';
-}
-
-async function connect() {
-  const url = document.getElementById('supaUrl').value.trim();
-  const anonKey = document.getElementById('supaKey').value.trim();
-  const roomCodeVal = document.getElementById('roomCode').value.trim();
-  const userLabel = document.getElementById('userLabel').value.trim();
-  const statusEl = document.getElementById('connectStatus');
-
-  if (!url || !anonKey || !roomCodeVal || !userLabel) {
-    statusEl.textContent = 'Fill in all four fields to connect.';
-    return;
-  }
-  roomConfig = { url, anonKey, roomCode: roomCodeVal, userLabel };
-  RoomConfig.save(roomConfig);
-  initSupabase();
-
-  const remoteEntries = await fetchEntriesRemote(roomCodeVal);
-  if (remoteEntries === null) {
-    statusEl.textContent = 'Could not connect — check your URL/key and that you ran the schema.sql setup.';
-    return;
-  }
-  statusEl.textContent = `Connected as ${userLabel} in room "${roomCodeVal}".`;
-  document.getElementById('modeSub').textContent = `Shared with your partner · room "${roomCodeVal}"`;
-  document.getElementById('shareCard').style.display = 'block';
-  await refreshFromRemote(['period_entries', 'moods']);
-  render();
-  renderMessages();
-  subscribeToRoom();
-  await trySubscribePush();
-}
-document.getElementById('connectBtn').addEventListener('click', connect);
-
-async function refreshFromRemote(tables) {
-  if (!isConnected() || !roomConfig) return;
-  if (tables.includes('period_entries')) {
-    const remote = await fetchEntriesRemote(roomConfig.roomCode);
-    if (remote) { entries = remote; saveLocalEntries(); }
-  }
-  if (tables.includes('moods')) {
-    const remote = await fetchMoodsRemote(roomConfig.roomCode);
-    if (remote) { moods = remote; saveLocalMoods(); }
-  }
-}
-
-function subscribeToRoom() {
-  if (realtimeChannel) supabaseClient.removeChannel(realtimeChannel);
-  realtimeChannel = subscribeRealtime(roomConfig.roomCode, async (table, payload) => {
-    if (table === 'period_entries') { await refreshFromRemote(['period_entries']); render(); }
-    if (table === 'moods') { await refreshFromRemote(['moods']); render(); }
-    if (table === 'messages') {
-      renderMessages();
-      if (payload && payload.new && payload.new.user_label !== roomConfig.userLabel) {
-        notifyIncomingMessage(payload.new);
-      }
-    }
-  });
-}
-
-function notifyIncomingMessage(msg) {
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  const emojiFor = { 1: '😣', 2: '😔', 3: '😐', 4: '🙂', 5: '😄' };
-  new Notification(`${msg.user_label} shared how they're feeling`, {
-    body: `${msg.mood ? emojiFor[msg.mood] + ' ' : ''}${msg.body}`,
-    icon: 'icons/icon.svg'
-  });
-}
-
 // ---------- Notifications ----------
+// Android (and the installed app) only allows notifications through the service
+// worker, so `new Notification(...)` is avoided.
+async function showNote(title, body) {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    await reg.showNotification(title, { body, icon: 'icons/icon.svg' });
+  } catch (e) { console.error('Notification failed', e); }
+}
+
 async function syncPredictionToDB() {
   if (!window.indexedDB) return;
-  const info = getPredictionInfo();
-  try { await CycleDB.set('prediction', info); } catch (e) { /* ignore */ }
+  try { await CycleDB.set('prediction', getPredictionInfo()); } catch (e) { /* ignore */ }
 }
 
 function updateNotifyUI() {
@@ -376,16 +391,14 @@ function updateNotifyUI() {
     return;
   }
   if (Notification.permission === 'granted') {
-    statusEl.textContent = isConnected()
-      ? 'Reminders are on, including a notification when your partner shares how they feel (while this app is installed and opened regularly).'
-      : 'Reminders are on. You\u2019ll get a notification before your predicted period and a daily nudge to log your mood.';
+    statusEl.textContent = 'Reminders are on. You’ll get a heads-up before your predicted period and a nudge to log your mood.';
     btn.textContent = 'Reminders enabled';
     btn.disabled = true;
   } else if (Notification.permission === 'denied') {
-    statusEl.textContent = 'Notifications were blocked. Enable them for this app in your phone/browser settings to turn reminders back on.';
+    statusEl.textContent = 'Notifications were blocked. Enable them for this app in your phone settings to turn reminders back on.';
     btn.disabled = true;
   } else {
-    statusEl.textContent = 'Turn on reminders for upcoming periods, daily mood check-ins, and messages from your partner.';
+    statusEl.textContent = 'Turn on reminders for upcoming periods and daily mood check-ins.';
     btn.disabled = false;
   }
 }
@@ -394,17 +407,15 @@ async function enableNotifications() {
   if (!('Notification' in window)) return;
   const perm = await Notification.requestPermission();
   updateNotifyUI();
-  if (perm === 'granted') {
-    await syncPredictionToDB();
-    if ('serviceWorker' in navigator) {
-      const reg = await navigator.serviceWorker.ready;
-      if ('periodicSync' in reg) {
-        try { await reg.periodicSync.register('cycle-check', { minInterval: 20 * 60 * 60 * 1000 }); } catch (e) { /* not supported */ }
-      }
+  if (perm !== 'granted') return;
+  await syncPredictionToDB();
+  if ('serviceWorker' in navigator) {
+    const reg = await navigator.serviceWorker.ready;
+    if ('periodicSync' in reg) {
+      try { await reg.periodicSync.register('cycle-check', { minInterval: 20 * 60 * 60 * 1000 }); } catch (e) { /* not supported */ }
     }
-    checkAndNotifyNow();
-    await trySubscribePush();
   }
+  checkAndNotifyNow();
 }
 document.getElementById('notifyBtn').addEventListener('click', enableNotifications);
 
@@ -412,71 +423,27 @@ function checkAndNotifyNow() {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const { avgCycle, lastStart } = getPredictionInfo();
   if (lastStart) {
-    const nextDate = new Date(lastStart + 'T00:00:00');
-    nextDate.setDate(nextDate.getDate() + Math.round(avgCycle));
-    const daysUntil = daysBetween(todayISO(), nextDate.toISOString().slice(0, 10));
+    const next = addDays(lastStart, Math.round(avgCycle));
+    const daysUntil = daysBetween(todayISO(), next);
     if (daysUntil >= 0 && daysUntil <= 2) {
-      new Notification('Period expected soon', {
-        body: `Predicted around ${nextDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}.`,
-        icon: 'icons/icon.svg'
-      });
+      showNote('Period expected soon', `Predicted around ${fmtDateShort(next)}.`);
     }
   }
-  const today = todayISO();
-  if (!moods.find(m => m.date === today)) {
-    new Notification('How are you feeling today?', { body: 'Tap to log today\u2019s mood.', icon: 'icons/icon.svg' });
+  if (!moods.find(m => m.date === todayISO())) {
+    showNote('How are you feeling today?', 'Tap to log today’s mood.');
   }
-}
-
-// Web Push subscription for true cross-device notifications (works even
-// when the app isn't open) — only activates if VAPID_PUBLIC_KEY below is
-// filled in and the notify edge function is deployed. See README.
-const VAPID_PUBLIC_KEY = ''; // paste your generated VAPID public key here
-
-function urlBase64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - base64String.length % 4) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(base64);
-  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
-}
-
-async function trySubscribePush() {
-  if (!VAPID_PUBLIC_KEY || !isConnected() || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
-  if (Notification.permission !== 'granted') return;
-  try {
-    const reg = await navigator.serviceWorker.ready;
-    let sub = await reg.pushManager.getSubscription();
-    if (!sub) {
-      sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
-      });
-    }
-    await savePushSubscriptionRemote(roomConfig.roomCode, roomConfig.userLabel, sub.toJSON());
-  } catch (e) { console.error('Push subscribe failed', e); }
 }
 
 // ---------- Init ----------
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('service-worker.js').catch(() => {});
 }
-
-roomConfig = RoomConfig.get();
-if (roomConfig) {
-  populateSetupForm();
-  initSupabase();
-}
+initSupabase();
 loadLocalEntries();
 loadLocalMoods();
 render();
 updateNotifyUI();
 syncPredictionToDB();
-
-if (roomConfig && isConnected()) {
-  document.getElementById('modeSub').textContent = `Shared with your partner · room "${roomConfig.roomCode}"`;
-  document.getElementById('shareCard').style.display = 'block';
-  refreshFromRemote(['period_entries', 'moods']).then(() => { render(); });
-  renderMessages();
-  subscribeToRoom();
-  trySubscribePush();
-}
+syncNow();
+window.addEventListener('online', syncNow);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) syncNow(); });
