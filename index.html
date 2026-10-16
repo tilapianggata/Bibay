@@ -12,51 +12,23 @@
 <body>
 <div class="wrap">
   <h1>🩸 Cycle Tracker</h1>
-  <div class="sub" id="modeSub">All your data stays on this device — nothing is sent to a server.</div>
+  <div class="sub">Backed up privately to the cloud. <span id="syncStatus" class="sync-status"></span></div>
 
-  <div class="card" id="setupCard">
-    <h2>Shared Account</h2>
-    <div class="note">Connect both phones to the same Supabase project and room code to share data. Leave this blank to keep using the app in local-only mode.</div>
-    <div class="add-form">
-      <div class="field">
-        <label for="supaUrl">Supabase Project URL</label>
-        <input type="text" id="supaUrl" placeholder="https://xxxx.supabase.co">
-      </div>
-      <div class="field">
-        <label for="supaKey">Supabase anon public key</label>
-        <input type="text" id="supaKey" placeholder="eyJhbGciOi...">
-      </div>
-      <div class="field">
-        <label for="roomCode">Room code (same on both phones)</label>
-        <input type="text" id="roomCode" placeholder="e.g. jay-and-sam-2026">
-      </div>
-      <div class="field">
-        <label for="userLabel">Your name (shown to your partner)</label>
-        <input type="text" id="userLabel" placeholder="e.g. Sam">
-      </div>
+  <div class="card">
+    <div class="cal-head">
+      <button class="cal-nav" id="calPrev" aria-label="Previous month">‹</button>
+      <div class="cal-title" id="calTitle"></div>
+      <button class="cal-nav" id="calNext" aria-label="Next month">›</button>
     </div>
-    <button class="primary" id="connectBtn">Connect</button>
-    <div class="note" id="connectStatus"></div>
-  </div>
-
-  <div class="card" id="shareCard" style="display:none">
-    <h2>Share How You're Feeling</h2>
-    <div class="mood-row" id="shareMoodRow">
-      <button class="mood-btn" data-share-mood="1">😣<span>Rough</span></button>
-      <button class="mood-btn" data-share-mood="2">😔<span>Low</span></button>
-      <button class="mood-btn" data-share-mood="3">😐<span>Okay</span></button>
-      <button class="mood-btn" data-share-mood="4">🙂<span>Good</span></button>
-      <button class="mood-btn" data-share-mood="5">😄<span>Great</span></button>
+    <div class="cal-grid" id="calGrid"></div>
+    <div class="cal-legend">
+      <span><i style="background:var(--period)"></i>Period</span>
+      <span><i class="dashed"></i>Expected period</span>
+      <span><i style="background:var(--fertile)"></i>Fertile window</span>
+      <span><i style="background:var(--follicular)"></i>Follicular</span>
+      <span><i style="background:var(--luteal)"></i>Luteal</span>
     </div>
-    <textarea id="shareText" placeholder="Say a bit more (optional)..." rows="2"></textarea>
-    <button class="primary" id="sendShareBtn">Send to partner</button>
-    <div id="messageFeed" class="message-feed"></div>
-  </div>
-
-  <div class="card" id="notifyCard">
-    <h2>Reminders</h2>
-    <div id="notifyStatus" class="note"></div>
-    <button class="secondary" id="notifyBtn">Enable notifications</button>
+    <div class="note">Tap a day to fill it in as a period start date below. Phases are estimates, not medical advice or contraception.</div>
   </div>
 
   <div class="card">
@@ -70,6 +42,21 @@
     </div>
     <div id="moodToday" class="note"></div>
     <div class="mood-history" id="moodHistory"></div>
+  </div>
+
+  <div class="card">
+    <h2>Log a New Period</h2>
+    <div class="add-form">
+      <div class="field">
+        <label for="startInput">Start date</label>
+        <input type="date" id="startInput">
+      </div>
+      <div class="field">
+        <label for="endInput">End date (optional)</label>
+        <input type="date" id="endInput">
+      </div>
+    </div>
+    <button class="primary" id="addBtn">Add Entry</button>
   </div>
 
   <div class="card" id="predictionCard">
@@ -88,19 +75,10 @@
     <div class="stat-grid" id="stats"></div>
   </div>
 
-  <div class="card">
-    <h2>Log a New Period</h2>
-    <div class="add-form">
-      <div class="field">
-        <label for="startInput">Start date</label>
-        <input type="date" id="startInput">
-      </div>
-      <div class="field">
-        <label for="endInput">End date (optional)</label>
-        <input type="date" id="endInput">
-      </div>
-    </div>
-    <button class="primary" id="addBtn">Add Entry</button>
+  <div class="card" id="notifyCard">
+    <h2>Reminders</h2>
+    <div id="notifyStatus" class="note"></div>
+    <button class="secondary" id="notifyBtn">Enable notifications</button>
   </div>
 
   <div class="card">
@@ -108,7 +86,7 @@
     <div id="history"></div>
   </div>
 
-  <div class="footer-note">Cycle Tracker — your data never leaves this device.</div>
+  <div class="footer-note">Cycle Tracker</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
