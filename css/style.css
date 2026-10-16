@@ -211,3 +211,47 @@ textarea {
 }
 .note { font-size: 0.78rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
 .footer-note { text-align: center; font-size: 0.72rem; color: var(--muted); margin-top: 10px; }
+
+/* ---------- Calendar ---------- */
+:root {
+  --period: #ef6f61;
+  --fertile: #f0c05a;
+  --follicular: #a56cf0;
+  --luteal: #7fd9a8;
+}
+.sync-status { display: block; margin-top: 2px; font-size: 0.75rem; }
+.sync-status.ok { color: var(--good); }
+.sync-status.bad { color: var(--warn); }
+
+.cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.cal-title { font-weight: 700; font-size: 1.05rem; }
+.cal-nav {
+  background: none; border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; width: 38px; height: 38px; font-size: 1.2rem; cursor: pointer;
+}
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); row-gap: 2px; text-align: center; }
+.cal-dow { font-size: 0.7rem; color: var(--muted); padding: 6px 0; }
+.cal-day {
+  position: relative; height: 48px; background: none; border: none; padding: 0;
+  font: inherit; font-weight: 700; font-size: 1rem; color: var(--muted); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.cal-day:focus-visible, .cal-nav:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+.cal-day .num { position: relative; z-index: 1; }
+.cal-day.follicular { color: var(--follicular); }
+.cal-day.fertile { color: var(--fertile); }
+.cal-day.luteal { color: var(--luteal); }
+.cal-day.period, .cal-day.predicted { color: var(--period); }
+.cal-day.period .num, .cal-day.predicted .num { transform: translateY(3px); }
+.cal-day svg {
+  position: absolute; inset: 0; margin: auto; width: 36px; height: 43px;
+  fill: rgba(239, 111, 97, 0.16); stroke: var(--period); stroke-width: 2.2; stroke-linejoin: round;
+}
+.cal-day.predicted svg { fill: none; stroke-dasharray: 4 3; }
+.cal-day.today::after {
+  content: ''; position: absolute; bottom: 1px; left: 50%; width: 5px; height: 5px;
+  margin-left: -2.5px; border-radius: 50%; background: var(--text);
+}
+.cal-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 12px; font-size: 0.72rem; color: var(--muted); }
+.cal-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+.cal-legend i.dashed { background: none; border: 1.5px dashed var(--period); }
